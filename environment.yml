@@ -1,0 +1,12 @@
+name: dalleclip
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - cudatoolkit=11.0.221
+  - python=3.7.9
+  - pytorch=1.7.1
+  - pip:
+    - clip==1.0
+    - dall-e==0.1
+    - tqdm==4.58.0
