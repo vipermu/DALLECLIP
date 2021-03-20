@@ -139,6 +139,7 @@ counter = 0
 rec_steps = 4
 x_rec_merged = None
 while True:
+    loss = 0
     for s_y in range(scale_y):
         for s_x in np.linspace(0, scale_x - 1, rec_steps):
             z_logits_part = z_logits[:, :, int(64 * s_y):int(64 * (s_y + 1)),
@@ -172,16 +173,16 @@ while True:
                 step_img_size = int(final_img_size / rec_steps)
 
                 y_init_img_part = step_img_size * s_y
-                x_init_img_part = step_img_size * s_x
+                x_init_img_part = int(step_img_size * s_x)
                 y_final_img_part = y_init_img_part + step_img_size * (s_y + 1)
-                x_final_img_part = x_init_img_part + step_img_size * (s_x + 1)
+                x_final_img_part = x_init_img_part + step_img_size * int(s_x + 1)
 
                 x_rec_merged[:, :, y_init_img_part:y_final_img_part,
                              x_init_img_part:
                              x_final_img_part] = x_rec[:, :, 0:(step_img_size *
                                                                 (s_y + 1)),
                                                        0:(step_img_size *
-                                                          (s_x + 1))]
+                                                          int(s_x + 1))]
 
             final_x_rec[:,
                         int(512 * s_y):int(512 * (s_y + 1)),
@@ -194,14 +195,15 @@ while True:
 
             part_loss = compute_clip_loss(x_rec_stacked, prompt)
             final_loss = compute_clip_loss(final_x_rec_stacked, prompt)
-            loss = (part_loss + final_loss)/2
+            loss += (part_loss + final_loss)/2
 
             print(loss)
             # print(z_logits[0, 0, 0])
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    loss /= rec_steps
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
     counter += 1
     if counter % img_save_freq == 0:
