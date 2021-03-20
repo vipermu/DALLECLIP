@@ -1,7 +1,5 @@
 import io
 import os
-import sys
-import requests
 import argparse
 
 import numpy as np
@@ -13,19 +11,12 @@ import torch.nn.functional as F
 import clip
 import PIL
 from dall_e import map_pixels, unmap_pixels, load_model
-from IPython.display import display, display_markdown
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
     '--output_path',
     type=str,
     default='./generations',
-    help='',
-)
-parser.add_argument(
-    '--ref_img_path',
-    type=str,
-    default="./muskete.jpeg",
     help='',
 )
 parser.add_argument(
@@ -37,7 +28,7 @@ parser.add_argument(
 parser.add_argument(
     '--lr',
     type=float,
-    default=1e-1,
+    default=3e-1,
     help='',
 )
 parser.add_argument(
@@ -50,7 +41,6 @@ parser.add_argument(
 args = parser.parse_args()
 
 output_path = args.output_path
-ref_img_path = args.ref_img_path
 prompt = args.prompt
 lr = args.lr
 img_save_freq = args.img_save_freq
@@ -62,25 +52,21 @@ if not os.path.exists(output_dir):
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("USING ", device)
 
-target_image_size = 256
-
-
-def download_image(url):
-    resp = requests.get(url)
-    resp.raise_for_status()
-    return PIL.Image.open(io.BytesIO(resp.content))
+target_img_size = 256
+final_img_size = 512
 
 
 def preprocess(img):
-    s = min(img.size)
+    min_img_dim = min(img.size)
 
-    if s < target_image_size:
-        raise ValueError(f'min dim for image {s} < {target_image_size}')
+    if min_img_dim < target_img_size:
+        raise ValueError(f'min dim for img {min_img_dim} < {target_img_size}')
 
-    r = target_image_size / s
-    s = (round(r * img.size[1]), round(r * img.size[0]))
-    img = TF.resize(img, s, interpolation=PIL.Image.LANCZOS)
-    img = TF.center_crop(img, output_size=2 * [target_image_size])
+    img_ratio = target_img_size / min_img_dim
+    min_img_dim = (round(img_ratio * img.size[1]),
+                   round(img_ratio * img.size[0]))
+    img = TF.resize(img, min_img_dim, interpolation=PIL.Image.LANCZOS)
+    img = TF.center_crop(img, output_size=2 * [target_img_size])
     img = torch.unsqueeze(T.ToTensor()(img), 0)
     return map_pixels(img)
 
@@ -100,20 +86,19 @@ def compute_clip_loss(img, text):
 
 def get_stacked_random_crops(img, num_random_crops=64):
     img_size = [img.shape[2], img.shape[3]]
+
     crop_list = []
     for _ in range(num_random_crops):
-        crop_size = int(img_size[0] * torch.zeros(1, ).uniform_(.5, .99))
+        crop_size_y = int(img_size[0] * torch.zeros(1, ).uniform_(.75, .95))
+        crop_size_x = int(img_size[1] * torch.zeros(1, ).uniform_(.75, .95))
 
-        x_offset = torch.randint(0, img_size[1] - crop_size, ())
-        y_offset = torch.randint(0, img_size[0] - crop_size, ())
+        y_offset = torch.randint(0, img_size[0] - crop_size_y, ())
+        x_offset = torch.randint(0, img_size[1] - crop_size_x, ())
 
-        crop = img[:, :, x_offset:x_offset + crop_size,
-                   y_offset:y_offset + crop_size]
-        crop = torch.nn.functional.interpolate(
-            crop,
-            (224, 224),
-            mode='bilinear',
-        )
+        crop = img[:, :, y_offset:y_offset + crop_size_y,
+                   x_offset:x_offset + crop_size_x]
+
+        crop = torch.nn.functional.upsample_bilinear(crop, (224, 224))
 
         crop_list.append(crop)
 
@@ -132,11 +117,14 @@ clip_transform = torchvision.transforms.Compose([
 dec = load_model("https://cdn.openai.com/dall-e/decoder.pkl", device)
 dec.eval()
 
-z_logits = torch.rand((1, 8192, 64, 64)).cuda()
-z_logits = torch.argmax(z_logits, axis=1)
-z_logits = F.one_hot(z_logits, num_classes=8192).permute(0, 3, 1, 2).float()
+scale_x = 2
+scale_y = 1
 
-z_logits = torch.nn.Parameter(z_logits, requires_grad=True)
+z_logits = torch.rand((1, 8192, 64 * scale_y, 64 * scale_x)).cuda()
+# z_logits = torch.argmax(z_logits, axis=1)
+# z_logits = F.one_hot(z_logits, num_classes=8192).permute(0, 3, 1, 2).float()
+
+z_logits = torch.nn.Parameter(z_logits, requires_grad=False)
 
 optimizer = torch.optim.Adam(
     params=[z_logits],
@@ -144,31 +132,78 @@ optimizer = torch.optim.Adam(
     betas=(0.9, 0.999),
 )
 
+final_x_rec = torch.zeros(
+    [3, final_img_size * scale_y, final_img_size * scale_x])
+
 counter = 0
+rec_steps = 4
+x_rec_merged = None
 while True:
-    z = torch.nn.functional.gumbel_softmax(
-        z_logits.permute(0, 2, 3, 1).view(1, 64**2, 8192),
-        hard=False,
-        dim=1,
-    ).view(1, 8192, 64, 64)
+    for s_y in range(scale_y):
+        for s_x in np.linspace(0, scale_x - 1, rec_steps):
+            z_logits_part = z_logits[:, :, int(64 * s_y):int(64 * (s_y + 1)),
+                         int(64 * s_x):int(64 * (s_x + 1))]
 
-    x_stats = dec(z).float()
-    x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))
+            # z = torch.nn.functional.gumbel_softmax(
+            #     z_logits[:, :, int(64 * s_y):int(64 * (s_y + 1)),
+            #              int(64 * s_x):int(64 * (s_x + 1))].permute(0, 2, 3, 1).reshape(
+            #                  1, 64**2, 8192),
+            #     hard=False,
+            #     dim=1,
+            # ).view(1, 8192, 64, 64)
 
-    x_rec = get_stacked_random_crops(x_rec, num_random_crops=16)
+            z = torch.nn.functional.gumbel_softmax(
+                z_logits_part.permute(0, 2, 3, 1).reshape(1, 64**2, 8192),
+                hard=False,
+                dim=1,
+            ).view(1, 8192, 64, 64)
 
-    loss = compute_clip_loss(x_rec, prompt)
+            x_stats = dec(z).float()
+            x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))
 
-    print(loss)
-    print(z_logits[0, 0, 0])
+            x_rec_stacked = get_stacked_random_crops(
+                x_rec,
+                num_random_crops=16,
+            )
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+            if x_rec_merged is None:
+                x_rec_merged = x_rec
+            else:
+                step_img_size = int(final_img_size / rec_steps)
+
+                y_init_img_part = step_img_size * s_y
+                x_init_img_part = step_img_size * s_x
+                y_final_img_part = y_init_img_part + step_img_size * (s_y + 1)
+                x_final_img_part = x_init_img_part + step_img_size * (s_x + 1)
+
+                x_rec_merged[:, :, y_init_img_part:y_final_img_part,
+                             x_init_img_part:
+                             x_final_img_part] = x_rec[:, :, 0:(step_img_size *
+                                                                (s_y + 1)),
+                                                       0:(step_img_size *
+                                                          (s_x + 1))]
+
+            final_x_rec[:,
+                        int(512 * s_y):int(512 * (s_y + 1)),
+                        int(512 * s_x):int(512 * (s_x + 1))] = x_rec_merged
+
+            final_x_rec_stacked = get_stacked_random_crops(
+                x_rec_merged,
+                num_random_crops=64,
+            )
+
+            part_loss = compute_clip_loss(x_rec_stacked, prompt)
+            final_loss = compute_clip_loss(final_x_rec_stacked, prompt)
+            loss = (part_loss + final_loss)/2
+
+            print(loss)
+            # print(z_logits[0, 0, 0])
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
     counter += 1
-
     if counter % img_save_freq == 0:
-        x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))
-        x_rec = T.ToPILImage(mode='RGB')(x_rec[0])
+        x_rec = T.ToPILImage(mode='RGB')(final_x_rec)
         x_rec.save(f"{output_dir}/{counter}.png")
