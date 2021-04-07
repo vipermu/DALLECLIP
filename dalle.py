@@ -99,6 +99,11 @@ def get_stacked_random_crops(img, num_random_crops=64):
                    x_offset:x_offset + crop_size_x]
 
         crop = torch.nn.functional.upsample_bilinear(crop, (224, 224))
+        # crop = torch.nn.functional.interpolate(
+        #     crop,
+        #     (224, 224),
+        #     mode='bilinear',
+        # )
 
         crop_list.append(crop)
 
@@ -117,14 +122,12 @@ clip_transform = torchvision.transforms.Compose([
 dec = load_model("https://cdn.openai.com/dall-e/decoder.pkl", device)
 dec.eval()
 
-scale_x = 2
+scale_x = 1
 scale_y = 1
 
-z_logits = torch.rand((1, 8192, 64 * scale_y, 64 * scale_x)).cuda()
-# z_logits = torch.argmax(z_logits, axis=1)
-# z_logits = F.one_hot(z_logits, num_classes=8192).permute(0, 3, 1, 2).float()
+z_logits = torch.rand((1, 8192, 64 * scale_y, int(64 * scale_x))).cuda()
 
-z_logits = torch.nn.Parameter(z_logits, requires_grad=False)
+z_logits = torch.nn.Parameter(z_logits, requires_grad=True)
 
 optimizer = torch.optim.Adam(
     params=[z_logits],
@@ -133,25 +136,18 @@ optimizer = torch.optim.Adam(
 )
 
 final_x_rec = torch.zeros(
-    [3, final_img_size * scale_y, final_img_size * scale_x])
+    [1, 3, final_img_size * scale_y, int(final_img_size * scale_x)])
 
 counter = 0
-rec_steps = 4
-x_rec_merged = None
+rec_steps = 3
+x_rec_merged = torch.zeros([1, 3, 512, 512])
 while True:
-    loss = 0
+    final_x_rec = final_x_rec.detach().clone()
+    x_rec_merged = x_rec_merged.detach().clone()
     for s_y in range(scale_y):
         for s_x in np.linspace(0, scale_x - 1, rec_steps):
             z_logits_part = z_logits[:, :, int(64 * s_y):int(64 * (s_y + 1)),
                          int(64 * s_x):int(64 * (s_x + 1))]
-
-            # z = torch.nn.functional.gumbel_softmax(
-            #     z_logits[:, :, int(64 * s_y):int(64 * (s_y + 1)),
-            #              int(64 * s_x):int(64 * (s_x + 1))].permute(0, 2, 3, 1).reshape(
-            #                  1, 64**2, 8192),
-            #     hard=False,
-            #     dim=1,
-            # ).view(1, 8192, 64, 64)
 
             z = torch.nn.functional.gumbel_softmax(
                 z_logits_part.permute(0, 2, 3, 1).reshape(1, 64**2, 8192),
@@ -162,43 +158,41 @@ while True:
             x_stats = dec(z).float()
             x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))
 
-            x_rec_stacked = get_stacked_random_crops(
-                x_rec,
-                num_random_crops=16,
-            )
+            # x_rec_stacked = get_stacked_random_crops(
+            #     x_rec,
+            #     num_random_crops=16,
+            # )
 
-            if x_rec_merged is None:
-                x_rec_merged = x_rec
-            else:
-                step_img_size = int(final_img_size / rec_steps)
+            step_img_size = int(final_img_size / rec_steps)
 
-                y_init_img_part = step_img_size * s_y
-                x_init_img_part = int(step_img_size * s_x)
-                y_final_img_part = y_init_img_part + step_img_size * (s_y + 1)
-                x_final_img_part = x_init_img_part + step_img_size * int(s_x + 1)
+            y_init_img_part = step_img_size * s_y
+            x_init_img_part = int(step_img_size * s_x)
+            y_final_img_part = y_init_img_part + step_img_size * (s_y + 1)
+            x_final_img_part = x_init_img_part + step_img_size * int(s_x + 1)
 
-                x_rec_merged[:, :, y_init_img_part:y_final_img_part,
-                             x_init_img_part:
-                             x_final_img_part] = x_rec[:, :, 0:(step_img_size *
-                                                                (s_y + 1)),
-                                                       0:(step_img_size *
-                                                          int(s_x + 1))]
+            x_rec_part = x_rec[:, :, 0:(step_img_size * (s_y + 1)),
+                               0:(step_img_size * int(s_x + 1))]
 
-            final_x_rec[:,
+            x_rec_merged[:, :, y_init_img_part:y_final_img_part,
+                            x_init_img_part:
+                            x_final_img_part] = x_rec_part
+
+            final_x_rec[:, :,
                         int(512 * s_y):int(512 * (s_y + 1)),
                         int(512 * s_x):int(512 * (s_x + 1))] = x_rec_merged
 
             final_x_rec_stacked = get_stacked_random_crops(
-                x_rec_merged,
+                final_x_rec,
                 num_random_crops=64,
             )
 
-            part_loss = compute_clip_loss(x_rec_stacked, prompt)
-            final_loss = compute_clip_loss(final_x_rec_stacked, prompt)
-            loss += (part_loss + final_loss)/2
+    loss = compute_clip_loss(final_x_rec_stacked, prompt)
+    # final_loss = compute_clip_loss(final_x_rec_stacked, prompt)
+    # final_loss = 0
+    # loss = (part_loss + final_loss)/2
 
-            print(loss)
-            # print(z_logits[0, 0, 0])
+    print(loss)
+    # print(z_logits[0, 0, 0])
 
     loss /= rec_steps
     optimizer.zero_grad()
@@ -207,5 +201,5 @@ while True:
 
     counter += 1
     if counter % img_save_freq == 0:
-        x_rec = T.ToPILImage(mode='RGB')(final_x_rec)
+        x_rec = T.ToPILImage(mode='RGB')(final_x_rec[0])
         x_rec.save(f"{output_dir}/{counter}.png")
